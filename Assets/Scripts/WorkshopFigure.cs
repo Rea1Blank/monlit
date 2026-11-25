@@ -6,9 +6,10 @@ namespace Monlit
     [DisallowMultipleComponent]
     public sealed class WorkshopFigure : MonoBehaviour
     {
-        private const float MaxEdgeNudge = .165f;
-        private const float MaxEdgeTurn = 9f;
-        private const float MaxCornerTravel = .265f;
+        private const float MaxEdgeNudge = .30f;
+        private const float MaxEdgeTurn = 18f;
+        private const float InteriorPositionTolerance = .17f;
+        private const float InteriorTurnTolerance = 12f;
         private const float MinContactInCells = .35f;
         private const float MinNeighborGap = .015f;
         private const float CellEpsilon = .0001f;
@@ -99,7 +100,7 @@ namespace Monlit
         {
             Vector3 relative = piece.Body.position - transform.position;
             return area > 0 && Mathf.Abs(relative.y) <= .09f && ContainsCenter(relative) &&
-                MapFootprint(piece, relative) != 0;
+                MapRestingFootprint(piece, relative) != 0;
         }
 
         internal bool TryGetInteriorPose(WorkshopPiece piece, out Vector3 position, out Quaternion rotation)
@@ -109,7 +110,7 @@ namespace Monlit
             Vector3 relative = position - transform.position;
             if (area == 0 || !ContainsCenter(relative) ||
                 Mathf.Abs(relative.y - WorkshopPuzzleArt.SeatY) > WorkshopPiece.CarryCaptureHeight ||
-                MapFootprint(piece, relative) == 0) return false;
+                MapFootprint(piece, relative, InteriorPositionTolerance, InteriorTurnTolerance) == 0) return false;
 
             // A manual placement keeps both horizontal coordinates. Squaring its faces lets it guide the next part.
             position.y = transform.position.y + WorkshopPuzzleArt.SeatY;
@@ -121,7 +122,7 @@ namespace Monlit
             position = piece.Body.position;
             rotation = piece.Body.rotation;
             Vector3 relative = position - transform.position;
-            if (area == 0 || !ContainsCenter(relative) ||
+            if (area == 0 || !ContainsCenter(relative, MaxEdgeNudge) ||
                 Mathf.Abs(relative.y - WorkshopPuzzleArt.SeatY) > WorkshopPiece.CarryCaptureHeight)
                 return false;
 
@@ -138,20 +139,18 @@ namespace Monlit
                 alignedCells[i] = center + new Vector2(offset.x, offset.z);
             }
 
-            float rotationTravel = 2f * piece.DeckClearance * Mathf.Sin(angle * .5f * Mathf.Deg2Rad);
-            if (rotationTravel > MaxCornerTravel) return false;
             CollectGuides(piece);
             float bestTravel = float.PositiveInfinity;
             // If two actual edges meet, choose the nearest fitting corner. A single edge only corrects its normal.
             foreach (float x in xCorrections)
                 foreach (float z in zCorrections)
-                    ConsiderEdgePose(piece, aligned, new Vector2(x, z), true, true, rotationTravel, ref bestTravel, ref position);
+                    ConsiderEdgePose(piece, aligned, new Vector2(x, z), true, true, ref bestTravel, ref position);
             if (float.IsPositiveInfinity(bestTravel))
             {
                 foreach (float x in xCorrections)
-                    ConsiderEdgePose(piece, aligned, new Vector2(x, 0f), true, false, rotationTravel, ref bestTravel, ref position);
+                    ConsiderEdgePose(piece, aligned, new Vector2(x, 0f), true, false, ref bestTravel, ref position);
                 foreach (float z in zCorrections)
-                    ConsiderEdgePose(piece, aligned, new Vector2(0f, z), false, true, rotationTravel, ref bestTravel, ref position);
+                    ConsiderEdgePose(piece, aligned, new Vector2(0f, z), false, true, ref bestTravel, ref position);
             }
             if (float.IsPositiveInfinity(bestTravel)) return false;
             rotation = aligned;
@@ -177,7 +176,7 @@ namespace Monlit
                 Vector3 relative = pos - transform.position;
                 if (!ContainsCenter(relative) || Mathf.Abs(relative.y - WorkshopPuzzleArt.SeatY) > .09f) continue;
                 Vector3 delta = pos - piece.Body.position;
-                float reach = piece.DeckClearance + other.DeckClearance + MaxCornerTravel;
+                float reach = piece.DeckClearance + other.DeckClearance + MaxEdgeNudge;
                 if (delta.x * delta.x + delta.z * delta.z > reach * reach) continue;
                 Quaternion pose = other.Body.rotation;
                 var aligned = GridRotation(pose);
@@ -201,23 +200,34 @@ namespace Monlit
             // All cells in one casting have the same fractional offset. A previous placement can have
             // its own offset along the board edge, so read the guide from its actual resting position.
             Vector2 difference = guideCell - alignedCells[0];
-            AddCorrection(xCorrections, difference.x - Mathf.Round(difference.x));
-            AddCorrection(zCorrections, difference.y - Mathf.Round(difference.y));
+            AddCorrections(xCorrections, difference.x);
+            AddCorrections(zCorrections, difference.y);
         }
 
-        private void AddCorrection(List<float> corrections, float value)
+        private void AddCorrections(List<float> corrections, float difference)
         {
-            if (Mathf.Abs(value) * cellSize > MaxEdgeNudge) return;
-            foreach (float existing in corrections)
-                if (Mathf.Abs(existing - value) <= CellEpsilon) return;
-            corrections.Add(value);
+            // Past half a cell the nearest grid line may be empty while the next one is a real edge.
+            float reach = MaxEdgeNudge / cellSize + CellEpsilon;
+            int last = Mathf.FloorToInt(difference + reach);
+            for (int line = Mathf.CeilToInt(difference - reach); line <= last; line++)
+            {
+                float correction = difference - line;
+                bool duplicate = false;
+                foreach (float existing in corrections)
+                {
+                    if (Mathf.Abs(existing - correction) > CellEpsilon) continue;
+                    duplicate = true;
+                    break;
+                }
+                if (!duplicate) corrections.Add(correction);
+            }
         }
 
         private void ConsiderEdgePose(WorkshopPiece piece, Quaternion rotation, Vector2 nudge, bool alignX,
-            bool alignZ, float rotationTravel, ref float bestTravel, ref Vector3 result)
+            bool alignZ, ref float bestTravel, ref Vector3 result)
         {
             float travel = nudge.magnitude * cellSize;
-            if (travel >= bestTravel || travel > MaxEdgeNudge || travel + rotationTravel > MaxCornerTravel) return;
+            if (travel >= bestTravel || travel > MaxEdgeNudge + cellSize * CellEpsilon) return;
             // A second, slightly offset neighbour may use part of the seam. Keep air between the actual sidewalls.
             float minCellSpacing = 1f - (2f * WorkshopPuzzleArt.CastingInset - MinNeighborGap) / cellSize;
             bool touchesX = false, touchesZ = false;
@@ -278,31 +288,37 @@ namespace Monlit
             return true;
         }
 
-        private bool ContainsCenter(Vector3 relative)
+        private bool ContainsCenter(Vector3 relative, float margin = 0f)
         {
-            return Mathf.Abs(relative.x) <= gridSize.x * cellSize * .5f &&
-                Mathf.Abs(relative.z) <= gridSize.y * cellSize * .5f;
+            return Mathf.Abs(relative.x) <= gridSize.x * cellSize * .5f + margin &&
+                Mathf.Abs(relative.z) <= gridSize.y * cellSize * .5f + margin;
         }
 
-        // Record grid cells only for whole castings that fit in the silhouette.
-        private int MapFootprint(WorkshopPiece piece, Vector3 relative, float tolerance = .12f)
+        // A latched edge placement has already passed the silhouette and collision checks.
+        // Sliding along a straight edge can leave its centre halfway between grid lines.
+        private int MapRestingFootprint(WorkshopPiece piece, Vector3 relative) =>
+            MapFootprint(piece, relative, piece.IsMagnetized ? float.PositiveInfinity : .12f);
+
+        private int MapFootprint(WorkshopPiece piece, Vector3 relative, float tolerance, float turnTolerance = 3f)
         {
             Quaternion pose = piece.Body.rotation;
             var rotation = GridRotation(pose);
-            if (Quaternion.Angle(rotation, pose) > 3f) return 0;
+            if (Quaternion.Angle(rotation, pose) > turnTolerance) return 0;
             var offsets = piece.Footprint;
             if (offsets == null || offsets.Length == 0) return 0;
             if (indices == null || indices.Length < offsets.Length) indices = new int[offsets.Length];
-            Vector2 gridPosition = GridPosition(relative);
+            Vector3 firstOffset = rotation * new Vector3(offsets[0].x, 0f, offsets[0].y);
+            Vector2 firstCell = GridPosition(relative) + new Vector2(firstOffset.x, firstOffset.z);
+            // Use the same side of a half-cell line for adjoining pieces despite floating-point drift.
+            var origin = Vector2Int.FloorToInt(firstCell + Vector2.one * (.5f + CellEpsilon));
+            if ((firstCell - (Vector2)origin).sqrMagnitude * cellSize * cellSize > tolerance * tolerance) return 0;
             for (int i = 0; i < offsets.Length; i++)
             {
-                var rotated = rotation * new Vector3(offsets[i].x, 0f, offsets[i].y);
-                var cell = gridPosition + new Vector2(rotated.x, rotated.z);
-                var nearest = Vector2Int.RoundToInt(cell);
-                if (nearest.x < 0 || nearest.y < 0 || nearest.x >= gridSize.x || nearest.y >= gridSize.y ||
-                    (cell - (Vector2)nearest).sqrMagnitude * cellSize * cellSize > tolerance * tolerance) return 0;
+                Vector2 delta = offsets[i] - offsets[0];
+                Vector3 rotated = rotation * new Vector3(delta.x, 0f, delta.y);
+                var nearest = origin + new Vector2Int(Mathf.RoundToInt(rotated.x), Mathf.RoundToInt(rotated.z));
+                if (!ContainsCell(nearest.x, nearest.y)) return 0;
                 int index = nearest.x + nearest.y * gridSize.x;
-                if (!silhouette[index]) return 0;
                 indices[i] = index;
             }
             return offsets.Length;
@@ -320,7 +336,7 @@ namespace Monlit
                 if (!piece) continue;
                 Vector3 relative = piece.Body.position - center;
                 if (Mathf.Abs(relative.y) > .09f || !ContainsCenter(relative) || !piece.IsResting) continue;
-                int n = MapFootprint(piece, relative);
+                int n = MapRestingFootprint(piece, relative);
                 if (n == 0) continue;
                 int free = 0;
                 while (free < n && !covered[indices[free]]) free++;
